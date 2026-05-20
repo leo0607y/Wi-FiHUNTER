@@ -3,25 +3,23 @@ import math
 import time
 import socket
 import struct
+import threading
 import ipaddress
 import scapy.all as scapy
 from mac_vendor_lookup import MacLookup, BaseMacLookup
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BaseMacLookup.cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac-vendors.txt")
+
+MDNS_TIMEOUT = 4.0   # mDNS 収集の最大待機秒数
 
 
 # ── ネットワーク検出 ─────────────────────────────────────────────────────────
 
 def get_active_network():
-    """
-    scapy.conf.iface（デフォルトインターフェース）を基点に
-    アクティブなネットワーク CIDR を取得する。
-    """
     try:
         iface    = scapy.conf.iface
         local_ip = scapy.get_if_addr(str(iface))
-
         if local_ip and local_ip not in ('0.0.0.0', '127.0.0.1'):
             for entry in scapy.conf.route.routes:
                 network, netmask, _, interface, address = (
@@ -33,7 +31,6 @@ def get_active_network():
                     return str(net_addr), local_ip, str(iface)
     except Exception as e:
         print(f"[警告] アクティブインターフェースの自動取得に失敗しました: {e}")
-
     return "192.168.1.0/24", "192.168.1.x", "Default"
 
 
@@ -80,98 +77,74 @@ def _decode_dns_name(data, offset, depth=0):
 
 
 def _parse_mdns_response(data):
-    """
-    mDNS レスポンスから PTR レコードのホスト名を抽出する。
-    回答セクションと追加セクション両方を走査する。
-    """
     try:
         if len(data) < 12:
             return None
-
         qdcount = int.from_bytes(data[4:6],  'big')
         ancount = int.from_bytes(data[6:8],  'big')
         nscount = int.from_bytes(data[8:10], 'big')
         arcount = int.from_bytes(data[10:12],'big')
-        total   = ancount + nscount + arcount
-
-        if total == 0:
+        if ancount + nscount + arcount == 0:
             return None
-
         offset = 12
         for _ in range(qdcount):
             _, offset = _decode_dns_name(data, offset)
             offset += 4
-
-        for _ in range(total):
+        for _ in range(ancount + nscount + arcount):
             if offset >= len(data):
                 break
             _, offset = _decode_dns_name(data, offset)
             if offset + 10 > len(data):
                 break
             rtype    = int.from_bytes(data[offset:offset + 2], 'big')
-            offset  += 8                                              # type + class + ttl
+            offset  += 8
             rdlength = int.from_bytes(data[offset:offset + 2], 'big')
             offset  += 2
-
-            if rtype == 12:   # PTR
+            if rtype == 12:  # PTR
                 name, _ = _decode_dns_name(data, offset)
                 name = name.removesuffix('.local').rstrip('.')
                 if name:
                     return name
-
             offset += rdlength
-
         return None
     except Exception:
         return None
 
 
-# ── mDNS バッチ収集（iPhone / Mac / Android / Linux Avahi） ──────────────────
+# ── mDNS バックグラウンドリスナー ────────────────────────────────────────────
 
-def collect_mdns_names_batch(ip_list, timeout=4):
+def start_mdns_listener(ip_list, mdns_results, done_event, timeout=MDNS_TIMEOUT):
     """
-    全デバイスに対して mDNS PTR クエリを
-      ① マルチキャスト (224.0.0.251:5353) — iPhoneなどが期待するアドレス
-      ② ユニキャスト (各IP:5353)           — フォールバック
-    で一括送信し、返答を集約する。
-    QU ビット (0x8001) を立てることでユニキャスト応答を誘導する。
+    バックグラウンドスレッドで mDNS クエリをマルチキャスト・ユニキャスト両方に送信し、
+    応答を mdns_results dict に書き込む。完了時に done_event をセット。
     """
-    names  = {}
     ip_set = set(ip_list)
-
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
         sock.settimeout(0.1)
 
-        # 全 IP にクエリ送信
         for ip in ip_list:
             reversed_ip = '.'.join(reversed(ip.split('.')))
-            qname       = _encode_dns_name(f"{reversed_ip}.in-addr.arpa")
-            # QU ビット付き PTR IN クエリ
-            query = (b'\x00\x00'           # Transaction ID
-                     b'\x00\x00'           # Flags: standard query
-                     b'\x00\x01'           # QDCOUNT = 1
-                     b'\x00\x00\x00\x00\x00\x00'  # AN/NS/AR = 0
+            qname = _encode_dns_name(f"{reversed_ip}.in-addr.arpa")
+            query = (b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
                      + qname
-                     + b'\x00\x0c'         # QTYPE  = PTR
-                     + b'\x80\x01')        # QCLASS = IN + QU bit
+                     + b'\x00\x0c\x80\x01')  # PTR IN + QU bit
             try:
                 sock.sendto(query, ('224.0.0.251', 5353))  # multicast
                 sock.sendto(query, (ip, 5353))              # unicast fallback
             except Exception:
                 pass
 
-        # 応答を timeout 秒間収集
         end_time = time.time() + timeout
         while time.time() < end_time:
             try:
                 data, (src_ip, _) = sock.recvfrom(4096)
-                if src_ip in ip_set and src_ip not in names:
+                if src_ip in ip_set and src_ip not in mdns_results:
                     name = _parse_mdns_response(data)
                     if name:
-                        names[src_ip] = name
+                        mdns_results[src_ip] = name
             except socket.timeout:
                 continue
             except Exception:
@@ -180,8 +153,8 @@ def collect_mdns_names_batch(ip_list, timeout=4):
         sock.close()
     except Exception:
         pass
-
-    return names
+    finally:
+        done_event.set()
 
 
 # ── NetBIOS（Windows / Samba） ───────────────────────────────────────────────
@@ -196,12 +169,11 @@ def get_netbios_name(ip, timeout=1):
         sock.sendto(packet, (ip, 137))
         data, _ = sock.recvfrom(1024)
         sock.close()
-
         if len(data) < 57:
             return None
         num_names = data[56]
         for i in range(num_names):
-            offset     = 57 + i * 18
+            offset = 57 + i * 18
             if offset + 18 > len(data):
                 break
             name_bytes = data[offset:offset + 15]
@@ -216,18 +188,36 @@ def get_netbios_name(ip, timeout=1):
         return None
 
 
-# ── DNS + NetBIOS フォールバック ─────────────────────────────────────────────
+# ── デバイス1台のホスト名解決（mDNS はバックグラウンド結果を待機） ───────────
 
-def get_hostname_fallback(ip):
-    """逆引き DNS → NetBIOS の順で解決（mDNS は事前バッチで収集済み）"""
+def resolve_device(ip, mdns_results, done_event):
+    """
+    DNS → NetBIOS → mDNS(バックグラウンド結果を待機) の順で解決し、
+    取れた瞬間に返す。
+    """
+    # 1. 逆引き DNS（ほぼ即時）
     try:
         hostname = socket.gethostbyaddr(ip)[0]
         if hostname and hostname != ip:
-            return hostname
+            return ip, hostname
     except Exception:
         pass
+
+    # 2. NetBIOS（~1秒）
     name = get_netbios_name(ip)
-    return name if name else "-"
+    if name:
+        return ip, name
+
+    # 3. mDNS バックグラウンドの結果を待機（最大 MDNS_TIMEOUT 秒）
+    deadline = time.time() + MDNS_TIMEOUT
+    while time.time() < deadline:
+        if ip in mdns_results:
+            return ip, mdns_results[ip]
+        if done_event.is_set():
+            break
+        time.sleep(0.05)
+
+    return ip, mdns_results.get(ip, "-")
 
 
 # ── ベンダー解決 ────────────────────────────────────────────────────────────
@@ -275,48 +265,51 @@ def main():
         print("\n[!] デバイスが見つかりませんでした。管理者権限で実行されているか確認してください。")
         return
 
-    ip_list = [d["ip"] for d in discovered_devices]
-    print(f"[*] {len(discovered_devices)} 台発見。")
+    ip_list    = [d["ip"] for d in discovered_devices]
+    device_map = {d["ip"]: d for d in discovered_devices}
 
-    # ① mDNS バッチ収集（iPhone / Mac / Android / Linux が主なターゲット）
-    print("[*] mDNS (Bonjour) でホスト名を収集中... (最大4秒)")
-    mdns_names = collect_mdns_names_batch(ip_list, timeout=4)
-    mdns_count = len(mdns_names)
-    print(f"    → mDNS: {mdns_count} 台取得")
+    print(f"[*] {len(discovered_devices)} 台発見。ホスト名解決を開始します...\n")
 
-    # ② mDNS で取れなかった分を DNS + NetBIOS で並列解決
-    remaining = [ip for ip in ip_list if ip not in mdns_names]
-    print(f"[*] DNS / NetBIOS で残り {len(remaining)} 台を解決中...")
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        fallback_map = {
-            ip: future.result()
-            for future, ip in [
-                (executor.submit(get_hostname_fallback, ip), ip)
-                for ip in remaining
-            ]
-        }
-
-    hostname_map = {**mdns_names, **fallback_map}
-
-    # 集計
-    resolved = sum(1 for v in hostname_map.values() if v != "-")
-    print(f"    → 合計 {resolved} / {len(ip_list)} 台のホスト名を取得。\n")
-
+    # テーブルヘッダーを先に出力
+    header = f"{'IPアドレス':<20} | {'デバイス名':<26} | {'MACアドレス':<18} | メーカー"
+    sep    = "-" * 90
     print("=" * 90)
     print("         現時点でWi-Fiに接続されているアクティブなデバイス一覧")
     print("=" * 90)
-    print(f"{'IPアドレス':<20} | {'デバイス名':<26} | {'MACアドレス':<18} | メーカー")
-    print("-" * 90)
+    print(header)
+    print(sep)
 
-    for device in discovered_devices:
-        ip      = device["ip"]
-        vendor  = resolve_vendor(device["mac"], mac_lookup)
-        host    = hostname_map.get(ip, "-")
-        ip_disp = f"{ip} (本体)" if ip == my_ip else ip
-        print(f"{ip_disp:<20} | {host:<26} | {device['mac']:<18} | {vendor}")
+    # mDNS リスナーをバックグラウンドスレッドで起動
+    mdns_results = {}
+    done_event   = threading.Event()
+    mdns_thread  = threading.Thread(
+        target=start_mdns_listener,
+        args=(ip_list, mdns_results, done_event, MDNS_TIMEOUT),
+        daemon=True
+    )
+    mdns_thread.start()
 
-    print("-" * 90)
-    print(f"アクティブなデバイス数: {len(discovered_devices)} 台 / ホスト名取得: {resolved} 台")
+    # 各デバイスの解決タスクを並列実行 → 完了した行からすぐに出力
+    resolved_count = 0
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        future_to_ip = {
+            executor.submit(resolve_device, ip, mdns_results, done_event): ip
+            for ip in ip_list
+        }
+
+        for future in as_completed(future_to_ip):
+            ip, hostname = future.result()
+            device  = device_map[ip]
+            vendor  = resolve_vendor(device["mac"], mac_lookup)
+            ip_disp = f"{ip} (本体)" if ip == my_ip else ip
+
+            print(f"{ip_disp:<20} | {hostname:<26} | {device['mac']:<18} | {vendor}")
+
+            if hostname != "-":
+                resolved_count += 1
+
+    print(sep)
+    print(f"アクティブなデバイス数: {len(discovered_devices)} 台 / ホスト名取得: {resolved_count} 台")
     print("=" * 90)
 
 
