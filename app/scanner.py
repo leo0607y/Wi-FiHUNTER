@@ -14,7 +14,7 @@ Wi-Fi 接続デバイス リアルタイム可視化ツール
   - その他: SSDP (UPnP) XML の friendlyName / modelName
 """
 
-import os, time, socket, struct, threading, ipaddress, re
+import os, time, socket, struct, threading, ipaddress, re, subprocess, ctypes
 import urllib.request
 import scapy.all as scapy
 from mac_vendor_lookup import MacLookup, BaseMacLookup
@@ -69,6 +69,89 @@ PORT_LABELS = {
     22:'SSH', 80:'HTTP', 139:'SMB', 443:'HTTPS', 445:'SMB',
     3389:'RDP', 5000:'UPnP', 8080:'HTTP-alt', 62078:'Apple-sync', 9100:'Printer',
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 管理者権限チェック / 非管理者用スキャン
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        try: return os.geteuid() == 0
+        except Exception: return False
+
+
+def scan_network_noadmin(ip_range):
+    """
+    管理者権限不要の ARP スキャン。
+    ping sweep で ARP キャッシュを埋め、arp -a で一覧取得。
+    """
+    network  = ipaddress.IPv4Network(ip_range, strict=False)
+    host_set = {str(h) for h in network.hosts()}
+
+    def ping_host(ip):
+        try:
+            subprocess.run(['ping', '-n', '1', '-w', '150', ip],
+                           capture_output=True, timeout=0.8)
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=min(100, len(host_set))) as ex:
+        list(ex.map(ping_host, sorted(host_set)))
+
+    devices = []
+    try:
+        result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s+(\d+\.\d+\.\d+\.\d+)\s+([\da-fA-F-]{17})', line)
+            if m:
+                ip  = m.group(1)
+                mac = m.group(2).replace('-', ':').lower()
+                if ip in host_set and mac != 'ff:ff:ff:ff:ff:ff':
+                    devices.append({'ip': ip, 'mac': mac})
+    except Exception:
+        pass
+
+    # 自分自身が含まれない場合は追加
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        my_ip = s.getsockname()[0]
+        s.close()
+        if my_ip in host_set and not any(d['ip'] == my_ip for d in devices):
+            import uuid
+            raw = uuid.getnode()
+            mac = ':'.join(f'{(raw >> (40 - 8*i)) & 0xff:02x}' for i in range(6))
+            devices.append({'ip': my_ip, 'mac': mac})
+    except Exception:
+        pass
+
+    devices.sort(key=lambda x: ipaddress.IPv4Address(x['ip']))
+    return devices
+
+
+def get_ttl_batch_noadmin(ip_list, timeout=1):
+    """ping コマンドで TTL を並列取得（管理者権限不要）"""
+    def get_ttl(ip):
+        try:
+            r = subprocess.run(
+                ['ping', '-n', '1', '-w', str(int(timeout * 1000)), ip],
+                capture_output=True, text=True, timeout=timeout + 1)
+            m = re.search(r'TTL=(\d+)', r.stdout, re.I)
+            if m:
+                return ip, int(m.group(1))
+        except Exception:
+            pass
+        return ip, None
+
+    ttl_map = {}
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        for ip, ttl in ex.map(get_ttl, ip_list):
+            if ttl is not None:
+                ttl_map[ip] = ttl
+    return ttl_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -610,6 +693,25 @@ def _fetch_ssdp_xml(url, timeout=3):
 # ポートスキャン / OS・デバイス種別推定
 # ─────────────────────────────────────────────────────────────────────────────
 
+def scan_apple_sync(ip_list, timeout=0.4):
+    """ポート 62078 (iTunes Wi-Fi Sync) を並列チェックして iOS デバイスの IP 集合を返す"""
+    result = set()
+    def check(ip):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            if s.connect_ex((ip, 62078)) == 0:
+                s.close()
+                return ip
+            s.close()
+        except: pass
+        return None
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for r in ex.map(check, ip_list):
+            if r: result.add(r)
+    return result
+
+
 def quick_port_scan(ip, ports=(22, 80, 139, 443, 445, 3389, 5000, 62078, 9100), timeout=0.35):
     open_ports = []
     for p in ports:
@@ -667,6 +769,9 @@ def infer_device_type(ip, vendor, hostname, os_hint, ports, model_id=None):
     if mid.startswith('audioaccessory'):                   return 'HomePod'
     if mid.startswith('mac'):                              return 'Mac'
 
+    # ポート 62078 はランダム MAC でも iOS/iPadOS を確定できる
+    if 62078 in p: return 'iPhone / iPad'
+
     if any(x in v for x in ('asus','buffalo','nec','tp-link','netgear','cisco','yamaha')):
         if ip.endswith('.1') or any(x in h for x in ('router','gateway','rt-','ap')):
             return 'ルーター / AP'
@@ -675,7 +780,6 @@ def infer_device_type(ip, vendor, hostname, os_hint, ports, model_id=None):
         for k,r in (('iphone','iPhone'),('ipad','iPad'),('watch','Apple Watch'),
                     ('appletv','Apple TV'),('homepod','HomePod'),('mac','Mac')):
             if k in h: return r
-        if 62078 in p: return 'iPhone / iPad'
         return 'Apple デバイス'
     if 3389 in p or h.startswith('desktop-'): return 'Windows デスクトップ'
     if h.startswith('laptop-') or 'laptop' in h: return 'Windows ノートPC'
@@ -720,17 +824,16 @@ def main():
     print("=" * W)
 
     network_cidr, my_ip, iface = get_active_network()
+    admin = _is_admin()
     print(f"[*] インターフェース : {iface}")
     print(f"[*] 自分の IP       : {my_ip}")
     print(f"[*] スキャン対象    : {network_cidr}")
+    print(f"[*] 実行モード      : {'管理者（高精度）' if admin else '一般ユーザー（ping モード）'}")
     print("-" * W)
 
     mac_lookup = load_vendor_lookup()
 
     # ── mDNS スニッファーを ARP スキャン前に開始 ────────────────────────────
-    # ip_list_ready[0] = None の間はスニッファーだけ動かし、
-    # ARP 完了後に ip_list_ready[0] = ip_list を代入することで
-    # targeted queries が送られる。
     mdns_results, mdns_models, done_event = {}, {}, threading.Event()
     ip_list_ready = [None]
 
@@ -742,9 +845,9 @@ def main():
     time.sleep(0.3)   # スニッファー安定待ち
 
     print("[*] ARP スキャン中...")
-    discovered = scan_network(network_cidr)
+    discovered = scan_network(network_cidr) if admin else scan_network_noadmin(network_cidr)
     if not discovered:
-        print("[!] デバイス未発見。管理者権限で実行されているか確認してください。")
+        print("[!] デバイス未発見。")
         done_event.set()
         return
 
@@ -761,8 +864,13 @@ def main():
         target=_ssdp_worker, args=(ip_list, ssdp_early, 7), daemon=True)
     ssdp_bg_thread.start()
 
-    print("[*] ICMP TTL 収集中（OS推定用）...")
-    ttl_map = get_ttl_batch(ip_list, timeout=2)
+    print("[*] TTL 収集中（OS推定用）/ ポート 62078 (iOS判定) チェック中...")
+    ttl_getter = get_ttl_batch if admin else get_ttl_batch_noadmin
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        ttl_fut        = ex.submit(ttl_getter, ip_list)
+        apple_sync_fut = ex.submit(scan_apple_sync, ip_list)
+    ttl_map        = ttl_fut.result()
+    apple_sync_set = apple_sync_fut.result()
 
     print(f"[*] ホスト名・OS・機種情報 を解決中（随時表示）...\n")
 
@@ -781,11 +889,12 @@ def main():
                    for ip in ip_list}
         for fut in as_completed(fut_map):
             ip, hostname, model_id = fut.result()
-            device   = device_map[ip]
-            vendor   = resolve_vendor(device["mac"], mac_lookup)
-            ttl      = ttl_map.get(ip)
-            os_hint  = infer_os(ttl, vendor, hostname, [], model_id)
-            dev_type = infer_device_type(ip, vendor, hostname, os_hint, [], model_id)
+            device      = device_map[ip]
+            vendor      = resolve_vendor(device["mac"], mac_lookup)
+            ttl         = ttl_map.get(ip)
+            ports_hint  = [62078] if ip in apple_sync_set else []
+            os_hint     = infer_os(ttl, vendor, hostname, ports_hint, model_id)
+            dev_type    = infer_device_type(ip, vendor, hostname, os_hint, ports_hint, model_id)
             ip_disp  = f"{ip} (本体)" if ip == my_ip else ip
             print(f"{ip_disp:<20} | {hostname:<24} | {os_hint:<14} | {dev_type:<22} | {device['mac']}")
             resolved_all[ip] = {'hostname': hostname, 'model_id': model_id}
@@ -833,13 +942,7 @@ def main():
         ip_disp  = f"{ip} (本体)" if ip == my_ip else ip
         print(f"{ip_disp:<20} | {model:<30} | {port_str:<30} | {vendor}")
 
-    # ── フッター ──────────────────────────────────────────────────────────
-    print("\n" + "─" * W)
-    print("  【MACアドレス ≠ PCブランド について】")
-    print("  MAC欄はWi-Fiアダプター（無線LANチップ基板）のメーカーです。PCブランドとは異なります。")
-    print("  例）ThinkPad(Lenovo) に搭載の JiangSu Fulian 製Wi-Fiカード → JiangSu Fulian と表示")
-    print("  例）ASUS製ノートPC に Intel Wi-Fi チップ → Intel Corporate と表示")
-    print("─" * W)
+    print("-" * W)
 
 
 if __name__ == "__main__":
