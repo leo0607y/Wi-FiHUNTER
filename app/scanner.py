@@ -321,15 +321,15 @@ def collect_mdns_with_sniff(ip_list_ready, mdns_results, mdns_models, done_event
             # サービスディスカバリ・モデル情報トリガー
             for svc in MDNS_SERVICES:
                 sq(svc)
-            # 各 IP の逆引き PTR（QU=True でユニキャスト応答を要求）
+            # 各 IP の逆引き PTR（QU=False: マルチキャスト応答させてスニッファーで拾う）
             for ip in ip_list:
                 rev   = '.'.join(reversed(ip.split('.')))
                 qname = _encode_dns_name(f"{rev}.in-addr.arpa")
                 query = (b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-                         + qname + b'\x00\x0c\x80\x01')
+                         + qname + b'\x00\x0c\x00\x01')
                 try:
-                    sock.sendto(query, ('224.0.0.251', 5353))  # multicast
-                    sock.sendto(query, (ip, 5353))              # unicast
+                    sock.sendto(query, ('224.0.0.251', 5353))  # multicast のみ
+                    sock.sendto(query, (ip, 5353))              # unicast (ポート5353から送信)
                 except: pass
 
         for round_no in range(QUERY_ROUNDS):
@@ -399,6 +399,82 @@ def _collect_mdns_raw_socket(ip_list, mdns_results, mdns_models, timeout=MDNS_TI
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LLMNR (Link-Local Multicast Name Resolution)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_llmnr_name(ip, timeout=1):
+    """LLMNR PTR クエリでホスト名取得（NetBIOS が無効な Windows/Linux デバイス向け）"""
+    try:
+        rev   = '.'.join(reversed(ip.split('.'))) + '.in-addr.arpa'
+        qname = _encode_dns_name(rev)
+        query = (b'\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+                 + qname + b'\x00\x0c\x00\x01')
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try: sock.sendto(query, ('224.0.0.252', 5355))
+        except: pass
+        try: sock.sendto(query, (ip, 5355))
+        except: pass
+        try:
+            while True:
+                data, (src, _) = sock.recvfrom(1024)
+                if src != ip or len(data) < 12:
+                    continue
+                ancount = int.from_bytes(data[6:8], 'big')
+                if ancount == 0:
+                    break
+                offset = 12
+                _, offset = _decode_dns_name(data, offset)
+                offset += 4
+                for _ in range(ancount):
+                    if offset >= len(data): break
+                    _, offset = _decode_dns_name(data, offset)
+                    if offset + 10 > len(data): break
+                    rtype  = int.from_bytes(data[offset:offset+2], 'big')
+                    offset += 8
+                    rdlen  = int.from_bytes(data[offset:offset+2], 'big')
+                    offset += 2
+                    if rtype == 12:
+                        name, _ = _decode_dns_name(data, offset)
+                        name = _strip_local(name)
+                        if _is_valid_hostname(name):
+                            sock.close()
+                            return name
+                    offset += rdlen
+                break
+        except socket.timeout:
+            pass
+        sock.close()
+    except Exception:
+        pass
+    return None
+
+
+def get_http_title(ip, timeout=1.2):
+    """HTTP ポート 80/8080 の HTML タイトルまたは Server ヘッダーからデバイス名を取得"""
+    for port in (80, 8080):
+        try:
+            url = f"http://{ip}:{port}/"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Wi-FiHUNTER/1.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                server  = r.headers.get('Server', '')
+                content = r.read(2048).decode('utf-8', errors='ignore')
+            m = re.search(r'<title[^>]*>(.*?)</title>', content, re.I | re.S)
+            if m:
+                title = re.sub(r'\s+', ' ', m.group(1)).strip()[:30]
+                bad   = ('403', '404', 'error', 'unauthorized', 'access denied', 'login', 'redirect')
+                if title and not any(b in title.lower() for b in bad):
+                    return title
+            if server:
+                s = server.split('/')[0].strip()[:30]
+                if len(s) > 2:
+                    return s
+        except Exception:
+            continue
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NetBIOS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -428,7 +504,7 @@ def get_netbios_name(ip, timeout=1):
 # デバイス解決（DNS → NetBIOS → mDNS スニッフ結果を待機）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_device(ip, mdns_results, mdns_models, done_event):
+def resolve_device(ip, mdns_results, mdns_models, done_event, ssdp_early=None):
     # 1. 逆引き DNS
     try:
         h = socket.gethostbyaddr(ip)[0]
@@ -448,6 +524,21 @@ def resolve_device(ip, mdns_results, mdns_models, done_event):
         if done_event.is_set():
             break
         time.sleep(0.05)
+    # 4. LLMNR
+    name = get_llmnr_name(ip)
+    if name:
+        return ip, name, mdns_models.get(ip)
+    # 5. SSDP friendlyName（バックグラウンド収集済み分）
+    if ssdp_early is not None:
+        ssdp = ssdp_early.get(ip)
+        if ssdp:
+            fname = ssdp.get('friendlyName') or ssdp.get('modelName')
+            if fname:
+                return ip, fname[:24].strip(), mdns_models.get(ip)
+    # 6. HTTP タイトル / Server ヘッダー
+    name = get_http_title(ip)
+    if name:
+        return ip, name, mdns_models.get(ip)
     return ip, mdns_results.get(ip, '-'), mdns_models.get(ip)
 
 
@@ -495,6 +586,12 @@ def collect_ssdp_info(ip_set, timeout=4):
     return ssdp_info
 
 
+def _ssdp_worker(ip_list, result_dict, timeout=7):
+    """SSDP 収集をバックグラウンドで実行し result_dict に格納（Phase1 の hostname fallback 用）"""
+    result = collect_ssdp_info(set(ip_list), timeout=timeout)
+    result_dict.update(result)
+
+
 def _fetch_ssdp_xml(url, timeout=3):
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Wi-FiHUNTER/1.0'})
@@ -538,10 +635,12 @@ def infer_os(ttl, vendor, hostname, ports, model_id=None):
     if mid.startswith('mac'):                               return 'macOS'
 
     # ホスト名 + ポートによる判定
+    # ポート 62078 は iOS/iPadOS 専用（Apple sync）。ランダム MAC でも確実に iOS と判定
+    if 62078 in p: return 'iOS'
+
     if 'apple' in v:
         if any(x in h for x in ('iphone','ipod')): return 'iOS'
         if 'ipad' in h:                             return 'iPadOS'
-        if 62078 in p:                              return 'iOS'    # iTunes sync port
         return 'macOS / iOS'
 
     if {445,3389}&p or h.startswith(('desktop-','laptop-')): return 'Windows'
@@ -656,6 +755,12 @@ def main():
     # ARP 結果を渡して targeted mDNS queries を開始させる
     ip_list_ready[0] = ip_list
 
+    # SSDP をバックグラウンドで即開始（Phase1 hostname fallback に間に合わせる）
+    ssdp_early = {}
+    ssdp_bg_thread = threading.Thread(
+        target=_ssdp_worker, args=(ip_list, ssdp_early, 7), daemon=True)
+    ssdp_bg_thread.start()
+
     print("[*] ICMP TTL 収集中（OS推定用）...")
     ttl_map = get_ttl_batch(ip_list, timeout=2)
 
@@ -672,7 +777,7 @@ def main():
 
     resolved_all = {}   # ip -> {hostname, model_id, ports}
     with ThreadPoolExecutor(max_workers=30) as ex:
-        fut_map = {ex.submit(resolve_device, ip, mdns_results, mdns_models, done_event): ip
+        fut_map = {ex.submit(resolve_device, ip, mdns_results, mdns_models, done_event, ssdp_early): ip
                    for ip in ip_list}
         for fut in as_completed(fut_map):
             ip, hostname, model_id = fut.result()
@@ -694,7 +799,8 @@ def main():
 
     # ── Phase 2: ポートスキャン + SSDP ────────────────────────────────────
     print("[*] ポートスキャン + SSDP 詳細情報 を収集中...")
-    ssdp_map = collect_ssdp_info(set(ip_list), timeout=4)
+    ssdp_bg_thread.join(timeout=2)   # バックグラウンド SSDP の完了を最大2秒待機
+    ssdp_map = ssdp_early
 
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures  = [(ex.submit(quick_port_scan, ip), ip) for ip in ip_list]
