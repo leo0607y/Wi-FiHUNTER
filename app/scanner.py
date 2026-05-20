@@ -39,6 +39,13 @@ MDNS_SERVICES = [
     '_http._tcp.local',               # HTTP サービス
     '_ssh._tcp.local',                # SSH
     '_printer._tcp.local',            # プリンター
+    '_homekit._tcp.local',            # HomeKit アクセサリ
+    '_mediaremotetv._tcp.local',      # Apple TV リモート
+    '_appletv-v2._tcp.local',         # Apple TV
+    '_daap._tcp.local',               # iTunes 共有
+    '_afpovertcp._tcp.local',         # AFP ファイル共有 (macOS)
+    '_continuity._tcp.local',         # Continuity (iPhone↔Mac)
+    '_rdlink._tcp.local',             # Apple Handoff
 ]
 
 # Apple デバイス識別子 → 機種名
@@ -326,10 +333,58 @@ def _extract_mdns_info(dns_bytes: bytes, src_ip: str):
                     if txt.lower().startswith('model='):
                         model_id = txt[6:].strip()
 
+            elif rtype == 33 and rdlength >= 7:   # SRV
+                # rec_name = "DeviceName._service._tcp.local" → インスタンス名を取り出す
+                instance = _strip_local(rec_name)
+                if _is_valid_hostname(instance) and not hostname:
+                    hostname = instance
+
             offset += rdlength
         return hostname, model_id
     except Exception:
         return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DHCP ホスト名スニッフ（スリープ中 iPhone のデバイス名取得）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_dhcp_hostnames(mac_to_ip, dhcp_results, done_event):
+    """
+    DHCP REQUEST/DISCOVER の option 12 (hostname) をスニッフしてデバイス名を収集。
+    mac_to_ip は ARP スキャン完了後に更新される共有 dict（参照渡し）。
+    iOS はプライベート MAC でも DHCP option 12 に本名を乗せる。
+    """
+    def on_dhcp(pkt):
+        try:
+            if not (pkt.haslayer(scapy.DHCP) and pkt.haslayer(scapy.Ether)):
+                return
+            mac = pkt[scapy.Ether].src.lower()
+            for opt in pkt[scapy.DHCP].options:
+                if not isinstance(opt, tuple) or opt[0] != 'hostname':
+                    continue
+                raw      = opt[1]
+                hostname = (raw.decode('utf-8', errors='ignore')
+                            if isinstance(raw, bytes) else str(raw)).strip()
+                if hostname and _is_valid_hostname(hostname):
+                    ip = mac_to_ip.get(mac)
+                    if ip and ip not in dhcp_results:
+                        dhcp_results[ip] = hostname
+                break
+        except Exception:
+            pass
+
+    try:
+        sniffer = scapy.AsyncSniffer(
+            filter='udp and (port 67 or port 68)',
+            prn=on_dhcp,
+            store=False)
+        sniffer.start()
+        done_event.wait()
+        try: sniffer.stop()
+        except: pass
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -587,7 +642,7 @@ def get_netbios_name(ip, timeout=1):
 # デバイス解決（DNS → NetBIOS → mDNS スニッフ結果を待機）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_device(ip, mdns_results, mdns_models, done_event, ssdp_early=None):
+def resolve_device(ip, mdns_results, mdns_models, done_event, ssdp_early=None, dhcp_results=None):
     # 1. 逆引き DNS
     try:
         h = socket.gethostbyaddr(ip)[0]
@@ -599,14 +654,18 @@ def resolve_device(ip, mdns_results, mdns_models, done_event, ssdp_early=None):
     name = get_netbios_name(ip)
     if name:
         return ip, name, mdns_models.get(ip)
-    # 3. mDNS スニッフ結果を待機
+    # 3. mDNS / DHCP 結果を並行待機（DHCP はリース更新タイミングで届く）
     deadline = time.time() + MDNS_TIMEOUT
     while time.time() < deadline:
         if ip in mdns_results:
             return ip, mdns_results[ip], mdns_models.get(ip)
+        if dhcp_results and ip in dhcp_results:
+            return ip, dhcp_results[ip], mdns_models.get(ip)
         if done_event.is_set():
             break
         time.sleep(0.05)
+    if dhcp_results and ip in dhcp_results:
+        return ip, dhcp_results[ip], mdns_models.get(ip)
     # 4. LLMNR
     name = get_llmnr_name(ip)
     if name:
@@ -833,15 +892,25 @@ def main():
 
     mac_lookup = load_vendor_lookup()
 
-    # ── mDNS スニッファーを ARP スキャン前に開始 ────────────────────────────
+    # ── mDNS + DHCP スニッファーを ARP スキャン前に開始 ─────────────────────
     mdns_results, mdns_models, done_event = {}, {}, threading.Event()
     ip_list_ready = [None]
+    mac_to_ip     = {}   # ARP 完了後に更新（DHCP スニッファーが参照）
+    dhcp_results  = {}
 
     mdns_thread = threading.Thread(
         target=collect_mdns_with_sniff,
         args=(ip_list_ready, mdns_results, mdns_models, done_event),
         daemon=True)
     mdns_thread.start()
+
+    if admin:
+        dhcp_thread = threading.Thread(
+            target=collect_dhcp_hostnames,
+            args=(mac_to_ip, dhcp_results, done_event),
+            daemon=True)
+        dhcp_thread.start()
+
     time.sleep(0.3)   # スニッファー安定待ち
 
     print("[*] ARP スキャン中...")
@@ -854,6 +923,9 @@ def main():
     ip_list    = [d["ip"] for d in discovered]
     device_map = {d["ip"]: d for d in discovered}
     print(f"[*] {len(discovered)} 台発見。")
+
+    # ARP 結果を共有 dict に反映（DHCP スニッファーが MAC→IP 解決に使用）
+    mac_to_ip.update({d["mac"].lower(): d["ip"] for d in discovered})
 
     # ARP 結果を渡して targeted mDNS queries を開始させる
     ip_list_ready[0] = ip_list
@@ -885,7 +957,7 @@ def main():
 
     resolved_all = {}   # ip -> {hostname, model_id, ports}
     with ThreadPoolExecutor(max_workers=30) as ex:
-        fut_map = {ex.submit(resolve_device, ip, mdns_results, mdns_models, done_event, ssdp_early): ip
+        fut_map = {ex.submit(resolve_device, ip, mdns_results, mdns_models, done_event, ssdp_early, dhcp_results): ip
                    for ip in ip_list}
         for fut in as_completed(fut_map):
             ip, hostname, model_id = fut.result()
