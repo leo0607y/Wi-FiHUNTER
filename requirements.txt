@@ -1,0 +1,2 @@
+scapy>=2.5.0
+mac-vendor-lookup>=0.1.15
